@@ -480,6 +480,10 @@ Use this for drop-in compatibility with scripts expecting OpenAI's TTS API struc
       "speed": 0.9
     }
     ```
+*   **Latency check:** WAV responses for medium/long text stream sentence chunks as they are generated. MP3 and Opus may still use a buffered compatibility path.
+    ```bash
+    curl -s -o /tmp/out.wav -w "TTFB=%{time_starttransfer}s TOTAL=%{time_total}s STATUS=%{http_code}\n" -X POST "$BASE_URL/v1/audio/speech" -H "Content-Type: application/json" -d '{"model":"kitten-tts-nano-0.1","input":"Welcome to Pathwisse","voice":"expr-voice-2-f","response_format":"wav"}'
+    ```
 
 ### Model Management Endpoints
 

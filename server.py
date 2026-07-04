@@ -726,6 +726,8 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
         # Return the streaming response
         return StreamingResponse(io.BytesIO(encoded_audio), media_type=media_type)
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error in openai_speech_endpoint: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

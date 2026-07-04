@@ -65,7 +65,7 @@ from pydantic import BaseModel, Field
 
 class OpenAISpeechRequest(BaseModel):
     model: str
-    input_: str = Field(..., alias="input")
+    input_: str = Field(..., alias="input", min_length=1)
     voice: str
     response_format: Literal["wav", "opus", "mp3"] = "wav"  # Add "mp3"
     speed: float = 1.0
@@ -693,6 +693,13 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
         )
 
     try:
+        accepted_voices = engine.get_all_accepted_voices()
+        if request.voice not in accepted_voices:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid voice '{request.voice}'. Accepted voices: {accepted_voices}",
+            )
+
         # Synthesize the audio
         audio_np, sr = engine.synthesize(
             text=request.input_,
@@ -726,6 +733,8 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
         # Return the streaming response
         return StreamingResponse(io.BytesIO(encoded_audio), media_type=media_type)
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error in openai_speech_endpoint: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

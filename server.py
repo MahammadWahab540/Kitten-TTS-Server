@@ -42,6 +42,7 @@ from config import (
     config_manager,
     get_host,
     get_port,
+    get_open_browser,
     get_log_file_path,
     get_output_path,
     get_ui_title,
@@ -65,7 +66,7 @@ from pydantic import BaseModel, Field
 
 class OpenAISpeechRequest(BaseModel):
     model: str
-    input_: str = Field(..., alias="input")
+    input_: str = Field(..., alias="input", min_length=1)
     voice: str
     response_format: Literal["wav", "opus", "mp3"] = "wav"  # Add "mp3"
     speed: float = 1.0
@@ -97,8 +98,24 @@ logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 logging.getLogger("watchfiles").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
+
+def _is_performance_monitor_enabled() -> bool:
+    """Return whether concise request performance logging is enabled."""
+    env_value = os.getenv("ENABLE_PERFORMANCE_MONITOR")
+    if env_value is not None:
+        return env_value.strip().lower() in ("true", "1", "t", "yes", "y")
+    return config_manager.get_bool("server.enable_performance_monitor", False)
+
+
+def _format_duration_ms(start_time: float, end_time: Optional[float] = None) -> str:
+    """Format an elapsed duration in milliseconds for compact logs."""
+    end = time.perf_counter() if end_time is None else end_time
+    return f"{(end - start_time) * 1000:.1f}ms"
+
 # --- Global Variables & Application Setup ---
 startup_complete_event = threading.Event()  # For coordinating browser opening
+app_start_time = time.monotonic()
+
 
 
 def _delayed_browser_open(host: str, port: int):
@@ -146,13 +163,20 @@ async def lifespan(app: FastAPI):
             )
         else:
             logger.info("TTS Model loaded successfully via engine.")
-            host_address = get_host()
-            server_port = get_port()
-            browser_thread = threading.Thread(
-                target=lambda: _delayed_browser_open(host_address, server_port),
-                daemon=True,
-            )
-            browser_thread.start()
+            engine.warmup(text="Hello")
+            if get_open_browser():
+                host_address = get_host()
+                server_port = get_port()
+                browser_thread = threading.Thread(
+                    target=lambda: _delayed_browser_open(host_address, server_port),
+                    daemon=True,
+                )
+                browser_thread.start()
+            else:
+                logger.info(
+                    "Browser auto-open is disabled. Set server.open_browser=true "
+                    "or OPEN_BROWSER=true to enable it for local UI development."
+                )
 
         logger.info("Application startup sequence complete.")
         startup_complete_event.set()
@@ -239,6 +263,56 @@ except RuntimeError as e_mount_outputs:
 # --- API Endpoints ---
 
 
+@app.get("/health", tags=["Health"])
+async def health_check():
+    """Reports process, model, ONNX provider, and readiness health."""
+    model_loaded = bool(engine.MODEL_LOADED)
+    loading = engine.is_loading()
+    download_status = engine.get_download_status()
+    load_error = download_status.get("error")
+    warmup_completed = startup_complete_event.is_set() and model_loaded
+    warmup_failed = (
+        startup_complete_event.is_set()
+        and not model_loaded
+        and not loading
+    )
+    provider_info = engine.get_onnx_provider_info()
+    model_info = engine.get_model_info()
+    configured_selector = engine.resolve_selector(
+        config_manager.get_string("model.repo_id", "KittenML/kitten-tts-nano-0.1")
+    )
+    model_repo_id = (
+        model_info.get("repo_id")
+        or engine.MODEL_REGISTRY[configured_selector]["repo_id"]
+    )
+
+    if model_loaded:
+        status = "ok"
+        status_code = 200
+    elif loading:
+        status = "model_loading"
+        status_code = 503
+    elif load_error:
+        status = f"model_load_failed: {load_error}"
+        status_code = 503
+    else:
+        status = "model_load_failed" if warmup_failed else "starting"
+        status_code = 503
+
+    payload = {
+        "status": status,
+        "model_loaded": model_loaded,
+        "warmup_completed": warmup_completed,
+        "warmup_failed": warmup_failed,
+        "available_voices_count": len(engine.get_available_voices()),
+        "provider": provider_info.get("active"),
+        "uptime_seconds": round(time.monotonic() - app_start_time, 3),
+        "model_repo_id": model_repo_id,
+        "device": model_info.get("device"),
+    }
+    return JSONResponse(content=payload, status_code=status_code)
+
+
 # --- Main UI Route ---
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 async def get_web_ui(request: Request):
@@ -283,6 +357,17 @@ async def get_model_registry_endpoint():
 async def get_model_status_endpoint():
     """Returns the current download/loading progress for model switching."""
     return engine.get_download_status()
+
+
+@app.get("/health", tags=["Health"])
+async def health_endpoint():
+    """Returns service, model, and warmup health state."""
+    return {
+        "status": "ok" if engine.MODEL_LOADED else "degraded",
+        "model_loaded": engine.MODEL_LOADED,
+        "model": engine.get_model_info(),
+        "warmup": engine.get_warmup_info(),
+    }
 
 
 # --- API Endpoint for Initial UI Data ---

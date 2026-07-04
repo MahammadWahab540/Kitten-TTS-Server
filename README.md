@@ -292,7 +292,7 @@ The first time you start the server, it will automatically download the default 
     python server.py
     ```
 
-3.  The server will start and automatically open the Web UI in your default browser.
+3.  Open the Web UI in your browser. Browser auto-open is disabled by default so hosted or containerized deployments do not launch a browser. For local UI development, set `OPEN_BROWSER=true` or `server.open_browser: true`.
     *   **Web UI:** `http://localhost:8005`
     *   **API Docs:** `http://localhost:8005/docs`
 

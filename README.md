@@ -533,3 +533,50 @@ This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) f
 ## 🤝 Contributing
 
 Contributions, issues, and feature requests are welcome! Please feel free to open an issue or submit a pull request.
+
+## Railway Production Deployment
+
+This server is configured for CPU-compatible Railway deployment with a baked default KittenTTS model. The CPU image uses `KittenML/kitten-tts-nano-0.8-int8` by default for lower startup size and lower CPU inference overhead. `Dockerfile.cpu` downloads the model at build time into `/app/model_cache/baked`, and runtime startup disables Hugging Face fallback with `KITTEN_TTS_DISABLE_HF_FALLBACK=1` so normal Railway startups do not download model files.
+
+### Required environment variables
+
+- `TTS_API_KEY`: API key required for TTS and management endpoints.
+- `ALLOWED_ORIGINS`: comma-separated CORS origins, for example `https://your-main-app-domain.com,http://localhost:3000,http://localhost:5173`.
+- `ENABLE_WEB_UI`: set `false` in production to disable the browser/admin UI.
+- `ENABLE_MANAGEMENT_ENDPOINTS`: set `false` in production to disable reload, unload, reset, and settings mutation endpoints.
+- `MAX_TTS_TEXT_CHARS`: maximum accepted TTS input length, default `1000`.
+- `TTS_REQUEST_TIMEOUT_SECONDS`: synthesis timeout, default `20`.
+- `RATE_LIMIT_REQUESTS_PER_MINUTE`: per-IP TTS limit, default `60`.
+- `ORT_INTRA_OP_NUM_THREADS`: ONNX Runtime intra-op threads, default `1` for Railway CPU.
+- `ORT_INTER_OP_NUM_THREADS`: reserved for ONNX Runtime inter-op tuning, default `1`.
+- `PORT`: Railway-provided service port; the app honors this when present.
+
+### Production vs development mode
+
+Production should use `ENABLE_WEB_UI=false` and `ENABLE_MANAGEMENT_ENDPOINTS=false`. Development can set either flag to `true`, but management endpoints still require `TTS_API_KEY`.
+
+### Auth examples
+
+```bash
+curl -X POST "$BASE_URL/api/tts/speak" \
+  -H "Authorization: Bearer $TTS_API_KEY" \
+  -H "Content-Type: application/json" \
+  --output speech.wav \
+  -d '{"text":"Welcome to Pathwisse","voice":"default","speed":1.0,"format":"wav","stream":true}'
+```
+
+```bash
+curl "$BASE_URL/api/tts/health"
+```
+
+### Health and latency
+
+Railway healthchecks should target `/health`. The endpoint only reports ready once the model is loaded and warmup has completed. Short warm requests target sub-0.8s time-to-first-audio on Railway CPU, subject to Railway CPU allocation and text length. TTS responses include `X-TTS-Total-Time-Ms`, `X-TTS-Inference-Time-Ms`, `X-TTS-Model`, and `X-TTS-Voice`.
+
+### Streaming behavior
+
+`stream=true` returns a browser-playable single valid audio response. WAV responses are not emitted as multiple independent WAV files; tests assert only one RIFF header is present and the result is decodable. Progressive PCM chunking can be added later if the client needs true byte-by-byte playback before full synthesis completes.
+
+### Known limits
+
+The in-memory rate limiter is per process. With multiple Railway replicas, each replica maintains its own counters. Management endpoints are intended for development and are disabled by default in production.

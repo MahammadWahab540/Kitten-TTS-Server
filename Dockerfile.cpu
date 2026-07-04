@@ -3,7 +3,11 @@ FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    HF_HOME=/app/hf_cache
+    HF_HOME=/app/hf_cache \
+    KITTEN_TTS_DEFAULT_MODEL=KittenML/kitten-tts-nano-0.8-int8 \
+    KITTEN_TTS_DISABLE_HF_FALLBACK=1 \
+    ORT_INTRA_OP_NUM_THREADS=1 \
+    ORT_INTER_OP_NUM_THREADS=1
 
 WORKDIR /app
 
@@ -22,6 +26,7 @@ RUN python -m pip install --upgrade pip \
 COPY . .
 
 RUN mkdir -p model_cache outputs logs hf_cache
+RUN python scripts/download_model.py
 
 EXPOSE 8005
 

@@ -16,7 +16,7 @@ from pathlib import Path
 
 from huggingface_hub import hf_hub_download
 
-DEFAULT_REPO_ID = "KittenML/kitten-tts-nano-0.1"
+DEFAULT_REPO_ID = "KittenML/kitten-tts-nano-0.8-int8"
 DEFAULT_BAKED_ROOT = "/app/model_cache/baked"
 
 

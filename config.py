@@ -43,6 +43,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         ),  # Path to the server log file.
         "log_file_max_size_mb": 10,  # Maximum size of a single log file before rotation.
         "log_file_backup_count": 5,  # Number of backup log files to keep.
+        "open_browser": False,  # Open the Web UI automatically; intended for local development only.
+        "enable_performance_monitor": False,  # Enables concise per-request performance logs.
     },
     "model": {  # Updated section for model source configuration
         "repo_id": "KittenML/kitten-tts-nano-0.1",  # KittenTTS Hugging Face repository ID
@@ -678,8 +680,32 @@ def get_host() -> str:
 
 def get_port() -> int:
     """Returns the server port number."""
-    return config_manager.get_int(
-        "server.port", _get_default_from_structure("server.port")
+    port_from_env = os.environ.get("PORT")
+    if port_from_env is not None:
+        try:
+            port = int(port_from_env)
+            logger.info("Using PORT environment variable for server port: %s", port)
+            return port
+        except (ValueError, TypeError):
+            logger.warning(
+                "Invalid PORT environment variable value '%s'. Using config fallback.",
+                port_from_env,
+            )
+
+    default_port = _get_default_from_structure("server.port")
+    port = config_manager.get_int("server.port", default_port)
+    logger.info("Using config fallback for server port: %s", port)
+    return port
+
+
+def get_open_browser() -> bool:
+    """Returns whether the server should open the Web UI in a browser on startup."""
+    env_value = os.getenv("OPEN_BROWSER")
+    if env_value is not None:
+        return env_value.strip().lower() in ("true", "1", "t", "yes", "y")
+
+    return config_manager.get_bool(
+        "server.open_browser", _get_default_from_structure("server.open_browser")
     )
 
 

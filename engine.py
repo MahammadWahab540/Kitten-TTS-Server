@@ -4,7 +4,6 @@
 
 import ctypes.util
 import gc
-import torch
 import os
 import json
 import logging
@@ -712,10 +711,8 @@ def unload_model() -> bool:
     gc.collect()
     logger.info("Python garbage collection completed.")
 
-    # Clear GPU cache if available
-    if torch.cuda.is_available():
-        logger.info("Clearing CUDA cache...")
-        torch.cuda.empty_cache()
+    # ONNX Runtime owns GPU allocations for inference. Avoid importing PyTorch here so
+    # CPU-only installations do not need torch just to unload the model.
 
     logger.info("Model unloaded and resources released.")
     return True

@@ -2,8 +2,8 @@
 # Core TTS model loading and speech generation logic for KittenTTS ONNX.
 # Supports multiple KittenTTS model variants with hot-swappable model switching.
 
+import ctypes.util
 import gc
-import torch
 import os
 import json
 import logging
@@ -360,15 +360,35 @@ def _init_espeak():
             logger.warning("eSpeak NG not found in common Windows locations.")
 
     elif os.name == "posix":  # Linux/macOS
-        logger.info("Checking for system-installed eSpeak NG on Linux...")
-        espeak_lib_path = "/usr/lib/x86_64-linux-gnu/libespeak-ng.so"
-        if Path(espeak_lib_path).exists():
+        logger.info("Checking for system-installed eSpeak NG on POSIX...")
+        candidate_paths = [
+            "/usr/lib/x86_64-linux-gnu/libespeak-ng.so.1",
+            "/usr/lib/x86_64-linux-gnu/libespeak-ng.so",
+            "/usr/lib/libespeak-ng.so.1",
+            "/usr/lib/libespeak-ng.so",
+        ]
+        espeak_lib_path = next(
+            (path for path in candidate_paths if Path(path).exists()),
+            None,
+        )
+
+        if espeak_lib_path is None:
+            espeak_lib_path = ctypes.util.find_library("espeak-ng")
+
+        if espeak_lib_path:
             os.environ["PHONEMIZER_ESPEAK_LIBRARY"] = espeak_lib_path
-            logger.info(f"Found and configured system eSpeak NG library: {espeak_lib_path}")
+            from phonemizer.backend.espeak.wrapper import (
+                EspeakWrapper as PhonemizeEspeakWrapper,
+            )
+
+            if hasattr(PhonemizeEspeakWrapper, "set_library"):
+                PhonemizeEspeakWrapper.set_library(espeak_lib_path)
+
+            logger.info(f"Found and configured eSpeak NG library: {espeak_lib_path}")
         else:
-            logger.warning(
-                f"Could not find system eSpeak NG library at {espeak_lib_path}. "
-                "Please ensure 'espeak-ng' is installed via your package manager."
+            raise RuntimeError(
+                "Could not find the eSpeak NG shared library. Please install both "
+                "'espeak-ng' and 'libespeak-ng1' using your package manager."
             )
 
     # Initialize phonemizer
@@ -396,6 +416,41 @@ def _init_espeak():
     # Initialize text cleaner
     text_cleaner = TextCleaner()
 
+
+def _is_truthy_env(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _repo_baked_model_dir(repo_id: str) -> Path:
+    baked_root = Path(os.environ.get("KITTEN_TTS_BAKED_MODEL_ROOT", "/app/model_cache/baked"))
+    return baked_root / repo_id.rstrip("/").split("/")[-1]
+
+
+def _load_baked_model_files(repo_id: str) -> Optional[Tuple[Path, Path, Path, Dict[str, Any]]]:
+    baked_dir = _repo_baked_model_dir(repo_id)
+    config_path = baked_dir / "config.json"
+    if not config_path.exists():
+        logger.info(f"No baked model config found at {config_path}; using Hugging Face fallback.")
+        return None
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        model_config = json.load(f)
+
+    model_filename = model_config.get("model_file")
+    voices_filename = model_config.get("voices")
+    if not model_filename or not voices_filename:
+        raise RuntimeError(f"Baked model config at {config_path} is missing model_file or voices.")
+
+    model_path = baked_dir / model_filename
+    voices_path = baked_dir / voices_filename
+    missing = [str(path) for path in (model_path, voices_path) if not path.exists()]
+    if missing:
+        raise FileNotFoundError(
+            "Baked model directory is incomplete. Missing file(s): " + ", ".join(missing)
+        )
+
+    logger.info(f"Loading KittenTTS model files from baked local path: {baked_dir}")
+    return config_path, model_path, voices_path, model_config
 
 def load_model() -> bool:
     """
@@ -433,48 +488,79 @@ def load_model() -> bool:
         # Ensure cache directory exists
         model_cache_path.mkdir(parents=True, exist_ok=True)
 
-        # Phase 1: Download config.json
-        _check_cancelled()
-        _update_download_status("downloading", f"Downloading config for {reg['display_name']}...", 10)
+        remote_fallback_disabled = _is_truthy_env("KITTEN_TTS_DISABLE_HF_FALLBACK")
 
-        config_path = hf_hub_download(
-            repo_id=model_repo_id,
-            filename="config.json",
-            cache_dir=str(model_cache_path),
-        )
+        try:
+            baked_files = _load_baked_model_files(model_repo_id)
+        except Exception as baked_error:
+            if remote_fallback_disabled:
+                raise RuntimeError(
+                    "Baked local model files are missing or invalid, and Hugging Face fallback "
+                    "is disabled with KITTEN_TTS_DISABLE_HF_FALLBACK. "
+                    f"Expected baked directory: {_repo_baked_model_dir(model_repo_id)}. "
+                    f"Details: {baked_error}"
+                ) from baked_error
+            logger.warning(
+                "Baked local model files are missing or invalid; falling back to Hugging Face. "
+                f"Details: {baked_error}"
+            )
+            baked_files = None
 
-        # Load config to get model filenames
-        with open(config_path, "r") as f:
-            model_config = json.load(f)
+        if baked_files is not None:
+            config_path, model_path, voices_path, model_config = baked_files
+            _update_download_status("loading", "Loading baked local model files...", 60)
+        else:
+            if remote_fallback_disabled:
+                raise RuntimeError(
+                    "No baked local model files were found and Hugging Face fallback is disabled "
+                    "with KITTEN_TTS_DISABLE_HF_FALLBACK. "
+                    f"Expected baked directory: {_repo_baked_model_dir(model_repo_id)}."
+                )
+
+            logger.info("Loading KittenTTS model files from Hugging Face fallback.")
+
+            # Phase 1: Download config.json
+            _check_cancelled()
+            _update_download_status("downloading", f"Downloading config for {reg['display_name']}...", 10)
+
+            config_path = hf_hub_download(
+                repo_id=model_repo_id,
+                filename="config.json",
+                cache_dir=str(model_cache_path),
+            )
+
+            # Load config to get model filenames
+            with open(config_path, "r", encoding="utf-8") as f:
+                model_config = json.load(f)
+
+            # Phase 2: Download model file (can be large - check cancellation)
+            _check_cancelled()
+            model_filename = model_config["model_file"]
+            _update_download_status(
+                "downloading",
+                f"Downloading model file ({reg['size']})...",
+                30,
+            )
+
+            model_path = hf_hub_download(
+                repo_id=model_repo_id,
+                filename=model_filename,
+                cache_dir=str(model_cache_path),
+            )
+
+            # Phase 3: Download voices file
+            _check_cancelled()
+            _update_download_status("downloading", "Downloading voice data...", 60)
+
+            voices_path = hf_hub_download(
+                repo_id=model_repo_id,
+                filename=model_config["voices"],
+                cache_dir=str(model_cache_path),
+            )
 
         model_type = model_config.get("type", "")
         if model_type not in ("ONNX1", "ONNX2"):
             raise ValueError(f"Unsupported model type '{model_type}'. Expected ONNX1 or ONNX2.")
-
-        # Phase 2: Download model file (can be large - check cancellation)
-        _check_cancelled()
-        model_filename = model_config["model_file"]
-        _update_download_status(
-            "downloading",
-            f"Downloading model file ({reg['size']})...",
-            30,
-        )
-
-        model_path = hf_hub_download(
-            repo_id=model_repo_id,
-            filename=model_filename,
-            cache_dir=str(model_cache_path),
-        )
-
-        # Phase 3: Download voices file
-        _check_cancelled()
-        _update_download_status("downloading", "Downloading voice data...", 60)
-
-        voices_path = hf_hub_download(
-            repo_id=model_repo_id,
-            filename=model_config["voices"],
-            cache_dir=str(model_cache_path),
-        )
 
         # Phase 4: Load voices data and voice aliases
         _update_download_status("loading", "Loading voice embeddings...", 70)
@@ -507,6 +593,21 @@ def load_model() -> bool:
         logger.info(f"Available ONNX Runtime providers: {available_providers}")
 
         sess_options = ort.SessionOptions()
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        intra_op_threads_raw = os.getenv("ORT_INTRA_OP_NUM_THREADS", "1")
+        try:
+            intra_op_threads = int(intra_op_threads_raw)
+            if intra_op_threads < 1:
+                raise ValueError
+        except ValueError:
+            logger.warning(
+                "Invalid ORT_INTRA_OP_NUM_THREADS value '%s'; defaulting to 1.",
+                intra_op_threads_raw,
+            )
+            intra_op_threads = 1
+        sess_options.intra_op_num_threads = intra_op_threads
+        sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+
         providers = []
         provider_options = []
 
@@ -528,6 +629,16 @@ def load_model() -> bool:
             providers = ["CPUExecutionProvider"]
             loaded_model_device = "cpu"
 
+        logger.info(f"Selected ONNX Runtime providers: {providers}")
+        logger.info(
+            "ONNX Runtime graph optimization level: %s",
+            sess_options.graph_optimization_level,
+        )
+        logger.info(
+            "ONNX Runtime intra-op thread count: %s",
+            sess_options.intra_op_num_threads,
+        )
+        logger.info("ONNX Runtime execution mode: %s", sess_options.execution_mode)
         logger.info(f"Initializing ONNX InferenceSession with providers: {providers}")
 
         if "CUDAExecutionProvider" in providers:
@@ -577,7 +688,7 @@ def load_model() -> bool:
             loaded_model_repo_id = None
             loaded_model_device = None
             _update_download_status("error", "", 0, str(e))
-            return False
+            raise RuntimeError(f"Failed to load KittenTTS model '{loaded_model_repo_id or 'unknown'}': {e}") from e
     except Exception as e:
         logger.error(f"Error loading KittenTTS model: {e}", exc_info=True)
         onnx_session = None
@@ -587,7 +698,7 @@ def load_model() -> bool:
         loaded_model_repo_id = None
         loaded_model_device = None
         _update_download_status("error", "", 0, str(e))
-        return False
+        raise RuntimeError(f"Failed to load KittenTTS model: {e}") from e
 
 
 def unload_model() -> bool:
@@ -628,10 +739,8 @@ def unload_model() -> bool:
     gc.collect()
     logger.info("Python garbage collection completed.")
 
-    # Clear GPU cache if available
-    if torch.cuda.is_available():
-        logger.info("Clearing CUDA cache...")
-        torch.cuda.empty_cache()
+    # ONNX Runtime owns GPU allocations for inference. Avoid importing PyTorch here so
+    # CPU-only installations do not need torch just to unload the model.
 
     logger.info("Model unloaded and resources released.")
     return True

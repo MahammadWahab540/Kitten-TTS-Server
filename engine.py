@@ -552,6 +552,21 @@ def load_model() -> bool:
         logger.info(f"Available ONNX Runtime providers: {available_providers}")
 
         sess_options = ort.SessionOptions()
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        intra_op_threads_raw = os.getenv("ORT_INTRA_OP_NUM_THREADS", "1")
+        try:
+            intra_op_threads = int(intra_op_threads_raw)
+            if intra_op_threads < 1:
+                raise ValueError
+        except ValueError:
+            logger.warning(
+                "Invalid ORT_INTRA_OP_NUM_THREADS value '%s'; defaulting to 1.",
+                intra_op_threads_raw,
+            )
+            intra_op_threads = 1
+        sess_options.intra_op_num_threads = intra_op_threads
+        sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+
         providers = []
         provider_options = []
 
@@ -573,6 +588,16 @@ def load_model() -> bool:
             providers = ["CPUExecutionProvider"]
             loaded_model_device = "cpu"
 
+        logger.info(f"Selected ONNX Runtime providers: {providers}")
+        logger.info(
+            "ONNX Runtime graph optimization level: %s",
+            sess_options.graph_optimization_level,
+        )
+        logger.info(
+            "ONNX Runtime intra-op thread count: %s",
+            sess_options.intra_op_num_threads,
+        )
+        logger.info("ONNX Runtime execution mode: %s", sess_options.execution_mode)
         logger.info(f"Initializing ONNX InferenceSession with providers: {providers}")
 
         if "CUDAExecutionProvider" in providers:

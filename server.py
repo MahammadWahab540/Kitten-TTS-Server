@@ -770,18 +770,6 @@ async def custom_tts_endpoint(
 
 @app.post("/v1/audio/speech", tags=["OpenAI Compatible"])
 async def openai_speech_endpoint(request: OpenAISpeechRequest):
-    request_id = str(uuid.uuid4())
-    request_start = time.perf_counter()
-    performance_monitor_enabled = _is_performance_monitor_enabled()
-    input_length = len(request.input_ or "")
-
-    if performance_monitor_enabled:
-        logger.info(
-            "openai_speech request_start "
-            f"request_id={request_id} input_chars={input_length} "
-            f"voice={request.voice} format={request.response_format} model={request.model}"
-        )
-
     # Check if the TTS model is loaded
     if not engine.MODEL_LOADED:
         raise HTTPException(
@@ -789,81 +777,113 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
             detail="TTS engine model is not currently loaded or available.",
         )
 
-    try:
-        accepted_voices = engine.get_all_accepted_voices()
-        if request.voice not in accepted_voices:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid voice '{request.voice}'. Accepted voices: {accepted_voices}",
-            )
+    request_start = time.perf_counter()
+    text_length = len(request.input_ or "")
+    chunk_size = 300
+    should_stream_chunks = text_length > chunk_size and request.response_format == "wav"
+    media_type = f"audio/{request.response_format}"
 
-        # Synthesize the audio
-        synthesis_start = time.perf_counter()
+    def log_timing(event_name: str, start_time: float = request_start) -> None:
+        elapsed = time.perf_counter() - start_time
+        total_elapsed = time.perf_counter() - request_start
+        logger.info(
+            "OpenAI speech timing: %s took %.3fs (total %.3fs)",
+            event_name,
+            elapsed,
+            total_elapsed,
+        )
+
+    def synthesize_and_encode_chunk(chunk_text: str, chunk_index: int) -> bytes:
+        chunk_start = time.perf_counter()
         audio_np, sr = engine.synthesize(
-            text=request.input_,
+            text=chunk_text,
             voice=request.voice,
             speed=request.speed,
         )
-        synthesis_end = time.perf_counter()
+        log_timing(f"chunk {chunk_index} synthesis", chunk_start)
 
         if audio_np is None or sr is None:
             raise HTTPException(
-                status_code=500, detail="TTS engine failed to synthesize audio."
+                status_code=500,
+                detail=f"TTS engine failed to synthesize audio for chunk {chunk_index}.",
             )
 
         # Ensure it's 1D
         if audio_np.ndim == 2:
             audio_np = audio_np.squeeze()
 
-        # Encode the audio to the requested format
-        encoding_start = time.perf_counter()
+        encode_start = time.perf_counter()
         encoded_audio = utils.encode_audio(
             audio_array=audio_np,
             sample_rate=sr,
             output_format=request.response_format,
             target_sample_rate=get_audio_sample_rate(),
         )
-        encoding_end = time.perf_counter()
+        log_timing(
+            f"chunk {chunk_index} {request.response_format} encoding", encode_start
+        )
 
         if encoded_audio is None:
-            raise HTTPException(status_code=500, detail="Failed to encode audio.")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to encode audio for chunk {chunk_index}.",
+            )
 
-        # Determine the media type
-        media_type = f"audio/{request.response_format}"
+        return encoded_audio
 
-        def audio_stream():
-            first_chunk_time = time.perf_counter()
-            yield encoded_audio
-            total_end = time.perf_counter()
-            if performance_monitor_enabled:
+    try:
+        if not should_stream_chunks:
+            if text_length > chunk_size and request.response_format != "wav":
                 logger.info(
-                    "openai_speech request_complete "
-                    f"request_id={request_id} input_chars={input_length} "
-                    f"voice={request.voice} format={request.response_format} "
-                    f"model={request.model} "
-                    f"synthesis={_format_duration_ms(synthesis_start, synthesis_end)} "
-                    f"encoding={_format_duration_ms(encoding_start, encoding_end)} "
-                    f"first_chunk={_format_duration_ms(request_start, first_chunk_time)} "
-                    f"total={_format_duration_ms(request_start, total_end)}"
+                    "OpenAI speech request uses response_format='%s'; using buffered compatibility path. "
+                    "Chunked low-latency streaming is currently enabled for WAV responses only.",
+                    request.response_format,
                 )
+            encoded_audio = synthesize_and_encode_chunk(request.input_, 1)
+            log_timing("buffered response ready")
+            return StreamingResponse(io.BytesIO(encoded_audio), media_type=media_type)
 
-        # Return the streaming response
-        return StreamingResponse(audio_stream(), media_type=media_type)
+        logger.info(
+            "OpenAI speech request length %d exceeds %d characters; streaming WAV sentence chunks.",
+            text_length,
+            chunk_size,
+        )
+
+        def audio_chunk_generator():
+            first_chunk_logged = False
+            first_yield_logged = False
+
+            try:
+                for chunk_index, text_chunk in enumerate(
+                    utils.chunk_text_by_sentences(request.input_, chunk_size), start=1
+                ):
+                    if not text_chunk.strip():
+                        continue
+
+                    chunk_start = time.perf_counter()
+                    encoded_audio = synthesize_and_encode_chunk(text_chunk, chunk_index)
+                    if not first_chunk_logged:
+                        log_timing("first chunk generated", chunk_start)
+                        first_chunk_logged = True
+
+                    if not first_yield_logged:
+                        log_timing("first chunk yielded")
+                        first_yield_logged = True
+                    yield encoded_audio
+
+                log_timing("streaming response completed")
+            except Exception as e:
+                logger.error(
+                    f"Error while streaming openai_speech_endpoint: {e}", exc_info=True
+                )
+                raise
+
+        return StreamingResponse(audio_chunk_generator(), media_type=media_type)
 
     except HTTPException:
         raise
     except Exception as e:
-        if performance_monitor_enabled:
-            logger.info(
-                "openai_speech request_failed "
-                f"request_id={request_id} input_chars={input_length} "
-                f"voice={request.voice} format={request.response_format} "
-                f"model={request.model} total={_format_duration_ms(request_start)}"
-            )
-        logger.error(
-            f"Error in openai_speech_endpoint request_id={request_id}: {e}",
-            exc_info=True,
-        )
+        logger.error(f"Error in openai_speech_endpoint: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 

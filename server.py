@@ -99,6 +99,8 @@ logger = logging.getLogger(__name__)
 
 # --- Global Variables & Application Setup ---
 startup_complete_event = threading.Event()  # For coordinating browser opening
+app_start_time = time.monotonic()
+
 
 
 def _delayed_browser_open(host: str, port: int):
@@ -237,6 +239,56 @@ except RuntimeError as e_mount_outputs:
 # templates removed - serving index.html as static file
 
 # --- API Endpoints ---
+
+
+@app.get("/health", tags=["Health"])
+async def health_check():
+    """Reports process, model, ONNX provider, and readiness health."""
+    model_loaded = bool(engine.MODEL_LOADED)
+    loading = engine.is_loading()
+    download_status = engine.get_download_status()
+    load_error = download_status.get("error")
+    warmup_completed = startup_complete_event.is_set() and model_loaded
+    warmup_failed = (
+        startup_complete_event.is_set()
+        and not model_loaded
+        and not loading
+    )
+    provider_info = engine.get_onnx_provider_info()
+    model_info = engine.get_model_info()
+    configured_selector = engine.resolve_selector(
+        config_manager.get_string("model.repo_id", "KittenML/kitten-tts-nano-0.1")
+    )
+    model_repo_id = (
+        model_info.get("repo_id")
+        or engine.MODEL_REGISTRY[configured_selector]["repo_id"]
+    )
+
+    if model_loaded:
+        status = "ok"
+        status_code = 200
+    elif loading:
+        status = "model_loading"
+        status_code = 503
+    elif load_error:
+        status = f"model_load_failed: {load_error}"
+        status_code = 503
+    else:
+        status = "model_load_failed" if warmup_failed else "starting"
+        status_code = 503
+
+    payload = {
+        "status": status,
+        "model_loaded": model_loaded,
+        "warmup_completed": warmup_completed,
+        "warmup_failed": warmup_failed,
+        "available_voices_count": len(engine.get_available_voices()),
+        "provider": provider_info.get("active"),
+        "uptime_seconds": round(time.monotonic() - app_start_time, 3),
+        "model_repo_id": model_repo_id,
+        "device": model_info.get("device"),
+    }
+    return JSONResponse(content=payload, status_code=status_code)
 
 
 # --- Main UI Route ---

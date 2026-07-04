@@ -9,7 +9,7 @@ import shutil
 from copy import deepcopy
 from threading import Lock
 from typing import Dict, Any, Optional, List, Tuple
-import torch  # For automatic CUDA/CPU device detection
+import onnxruntime as ort  # For automatic CPU/GPU provider detection
 from pathlib import Path
 
 # Standard logger setup
@@ -170,7 +170,7 @@ class YamlConfigManager:
         string paths in the configuration data to Path objects for internal use.
         The 'config_data' dictionary is modified in place.
         """
-        # Resolve TTS device setting with robust CUDA detection.
+        # Resolve TTS device setting using ONNX Runtime provider availability.
         current_device_setting = _get_nested_value(
             config_data, ["tts_engine", "device"], "auto"
         )
@@ -205,28 +205,19 @@ class YamlConfigManager:
 
     def _detect_best_device(self) -> str:
         """
-        Robustly detects the best available device for TTS processing.
-        Tests actual CUDA functionality rather than just checking availability.
+        Detects the best available device for TTS processing using ONNX Runtime.
 
         Returns:
-            str: 'cuda' if CUDA is truly functional, 'cpu' otherwise.
+            str: 'cuda' if ONNX Runtime exposes CUDAExecutionProvider, 'cpu' otherwise.
         """
-        # Test CUDA first as it's generally preferred for ML workloads
-        if torch.cuda.is_available():
-            try:
-                # Actually test CUDA functionality by creating a tensor and moving it to CUDA
-                test_tensor = torch.tensor([1.0])
-                test_tensor = test_tensor.cuda()
-                test_tensor = test_tensor.cpu()  # Clean up
-                logger.info("CUDA test successful. Using CUDA device.")
-                return "cuda"
-            except Exception as e:
-                logger.warning(
-                    f"CUDA is reported as available but failed functionality test: {e}. "
-                    f"This usually means PyTorch was not compiled with CUDA support."
-                )
+        available_providers = ort.get_available_providers()
+        logger.info(f"Available ONNX Runtime providers: {available_providers}")
 
-        logger.info("CUDA not available or functional. Using CPU.")
+        if "CUDAExecutionProvider" in available_providers:
+            logger.info("CUDAExecutionProvider is available. Using CUDA device.")
+            return "cuda"
+
+        logger.info("CUDAExecutionProvider is not available. Using CPU.")
         return "cpu"
 
     def _prepare_config_for_saving(self, config_dict: Dict[str, Any]) -> Dict[str, Any]:

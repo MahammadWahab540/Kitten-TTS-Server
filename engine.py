@@ -232,6 +232,22 @@ def get_all_accepted_voices() -> List[str]:
     return named
 
 
+def get_onnx_provider_info() -> Dict[str, Any]:
+    """Returns ONNX Runtime provider information for the active session."""
+    active_providers: List[str] = []
+    if onnx_session is not None:
+        try:
+            active_providers = list(onnx_session.get_providers())
+        except Exception as e:
+            logger.warning(f"Failed to read active ONNX providers: {e}")
+
+    return {
+        "active": active_providers[0] if active_providers else None,
+        "active_providers": active_providers,
+        "available_providers": list(ort.get_available_providers()),
+    }
+
+
 def get_model_info() -> Dict[str, Any]:
     """
     Returns information about the currently loaded model.

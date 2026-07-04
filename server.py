@@ -65,7 +65,7 @@ from pydantic import BaseModel, Field
 
 class OpenAISpeechRequest(BaseModel):
     model: str
-    input_: str = Field(..., alias="input")
+    input_: str = Field(..., alias="input", min_length=1)
     voice: str
     response_format: Literal["wav", "opus", "mp3"] = "wav"  # Add "mp3"
     speed: float = 1.0
@@ -96,6 +96,20 @@ logging.basicConfig(
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 logging.getLogger("watchfiles").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
+
+
+def _is_performance_monitor_enabled() -> bool:
+    """Return whether concise request performance logging is enabled."""
+    env_value = os.getenv("ENABLE_PERFORMANCE_MONITOR")
+    if env_value is not None:
+        return env_value.strip().lower() in ("true", "1", "t", "yes", "y")
+    return config_manager.get_bool("server.enable_performance_monitor", False)
+
+
+def _format_duration_ms(start_time: float, end_time: Optional[float] = None) -> str:
+    """Format an elapsed duration in milliseconds for compact logs."""
+    end = time.perf_counter() if end_time is None else end_time
+    return f"{(end - start_time) * 1000:.1f}ms"
 
 # --- Global Variables & Application Setup ---
 startup_complete_event = threading.Event()  # For coordinating browser opening
@@ -685,6 +699,18 @@ async def custom_tts_endpoint(
 
 @app.post("/v1/audio/speech", tags=["OpenAI Compatible"])
 async def openai_speech_endpoint(request: OpenAISpeechRequest):
+    request_id = str(uuid.uuid4())
+    request_start = time.perf_counter()
+    performance_monitor_enabled = _is_performance_monitor_enabled()
+    input_length = len(request.input_ or "")
+
+    if performance_monitor_enabled:
+        logger.info(
+            "openai_speech request_start "
+            f"request_id={request_id} input_chars={input_length} "
+            f"voice={request.voice} format={request.response_format} model={request.model}"
+        )
+
     # Check if the TTS model is loaded
     if not engine.MODEL_LOADED:
         raise HTTPException(
@@ -693,12 +719,21 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
         )
 
     try:
+        accepted_voices = engine.get_all_accepted_voices()
+        if request.voice not in accepted_voices:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid voice '{request.voice}'. Accepted voices: {accepted_voices}",
+            )
+
         # Synthesize the audio
+        synthesis_start = time.perf_counter()
         audio_np, sr = engine.synthesize(
             text=request.input_,
             voice=request.voice,
             speed=request.speed,
         )
+        synthesis_end = time.perf_counter()
 
         if audio_np is None or sr is None:
             raise HTTPException(
@@ -710,12 +745,14 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
             audio_np = audio_np.squeeze()
 
         # Encode the audio to the requested format
+        encoding_start = time.perf_counter()
         encoded_audio = utils.encode_audio(
             audio_array=audio_np,
             sample_rate=sr,
             output_format=request.response_format,
             target_sample_rate=get_audio_sample_rate(),
         )
+        encoding_end = time.perf_counter()
 
         if encoded_audio is None:
             raise HTTPException(status_code=500, detail="Failed to encode audio.")
@@ -723,13 +760,39 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
         # Determine the media type
         media_type = f"audio/{request.response_format}"
 
+        def audio_stream():
+            first_chunk_time = time.perf_counter()
+            yield encoded_audio
+            total_end = time.perf_counter()
+            if performance_monitor_enabled:
+                logger.info(
+                    "openai_speech request_complete "
+                    f"request_id={request_id} input_chars={input_length} "
+                    f"voice={request.voice} format={request.response_format} "
+                    f"model={request.model} "
+                    f"synthesis={_format_duration_ms(synthesis_start, synthesis_end)} "
+                    f"encoding={_format_duration_ms(encoding_start, encoding_end)} "
+                    f"first_chunk={_format_duration_ms(request_start, first_chunk_time)} "
+                    f"total={_format_duration_ms(request_start, total_end)}"
+                )
+
         # Return the streaming response
-        return StreamingResponse(io.BytesIO(encoded_audio), media_type=media_type)
+        return StreamingResponse(audio_stream(), media_type=media_type)
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error in openai_speech_endpoint: {e}", exc_info=True)
+        if performance_monitor_enabled:
+            logger.info(
+                "openai_speech request_failed "
+                f"request_id={request_id} input_chars={input_length} "
+                f"voice={request.voice} format={request.response_format} "
+                f"model={request.model} total={_format_duration_ms(request_start)}"
+            )
+        logger.error(
+            f"Error in openai_speech_endpoint request_id={request_id}: {e}",
+            exc_info=True,
+        )
         raise HTTPException(status_code=500, detail=str(e))
 
 

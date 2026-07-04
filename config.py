@@ -43,6 +43,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         ),  # Path to the server log file.
         "log_file_max_size_mb": 10,  # Maximum size of a single log file before rotation.
         "log_file_backup_count": 5,  # Number of backup log files to keep.
+        "enable_performance_monitor": False,  # Enables concise per-request performance logs.
     },
     "model": {  # Updated section for model source configuration
         "repo_id": "KittenML/kitten-tts-nano-0.1",  # KittenTTS Hugging Face repository ID

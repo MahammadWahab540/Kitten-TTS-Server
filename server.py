@@ -14,7 +14,7 @@ import yaml  # For loading presets
 import numpy as np
 from pathlib import Path
 from contextlib import asynccontextmanager
-from typing import Optional, List, Dict, Any, Literal
+from typing import Optional, List, Dict, Any, Literal, Iterator
 import webbrowser  # For automatic browser opening
 import threading  # For automatic browser opening
 
@@ -505,7 +505,7 @@ async def custom_tts_endpoint(
         )
 
     logger.info(
-        f"Received /tts request: voice='{request.voice}', format='{request.output_format}'"
+        f"Received /tts request: voice='{request.voice}', format='{request.output_format}', stream={request.stream}"
     )
     logger.debug(
         f"TTS params: speed={request.speed}, split={request.split_text}, chunk_size={request.chunk_size}"
@@ -514,9 +514,10 @@ async def custom_tts_endpoint(
 
     perf_monitor.record("Parameters resolved")
 
-    all_audio_segments_np: List[np.ndarray] = []
     final_output_sample_rate = get_audio_sample_rate()
-    engine_output_sample_rate: Optional[int] = None
+    output_format_str = (
+        request.output_format if request.output_format else get_audio_output_format()
+    )
 
     if request.split_text and len(request.text) > (
         request.chunk_size * 1.5 if request.chunk_size else 120 * 1.5
@@ -537,6 +538,88 @@ async def custom_tts_endpoint(
         raise HTTPException(
             status_code=400, detail="Text processing resulted in no usable chunks."
         )
+
+    if request.stream:
+        media_type = f"audio/{output_format_str}"
+
+        def stream_encoded_chunks() -> Iterator[bytes]:
+            engine_output_sample_rate: Optional[int] = None
+            chunks_yielded = 0
+
+            for i, chunk in enumerate(text_chunks):
+                logger.info(f"Streaming synthesis for chunk {i+1}/{len(text_chunks)}...")
+                try:
+                    chunk_audio_np, chunk_sr_from_engine = engine.synthesize(
+                        text=chunk,
+                        voice=request.voice,
+                        speed=(
+                            request.speed
+                            if request.speed is not None
+                            else get_gen_default_speed()
+                        ),
+                    )
+                    perf_monitor.record(f"Engine synthesized streaming chunk {i+1}")
+
+                    if chunk_audio_np is None or chunk_sr_from_engine is None:
+                        raise RuntimeError(
+                            f"TTS engine failed to synthesize audio for chunk {i+1}."
+                        )
+
+                    if engine_output_sample_rate is None:
+                        engine_output_sample_rate = chunk_sr_from_engine
+                    elif engine_output_sample_rate != chunk_sr_from_engine:
+                        logger.warning(
+                            f"Inconsistent sample rate from engine: chunk {i+1} ({chunk_sr_from_engine}Hz) "
+                            f"differs from previous ({engine_output_sample_rate}Hz). Encoding chunk with its own SR."
+                        )
+
+                    encoded_chunk = utils.encode_audio(
+                        audio_array=chunk_audio_np,
+                        sample_rate=chunk_sr_from_engine,
+                        output_format=output_format_str,
+                        target_sample_rate=final_output_sample_rate,
+                    )
+                    perf_monitor.record(
+                        f"Streaming chunk {i+1} encoded to {output_format_str} "
+                        f"(target SR: {final_output_sample_rate}Hz from engine SR: {chunk_sr_from_engine}Hz)"
+                    )
+
+                    if encoded_chunk is None or len(encoded_chunk) < 100:
+                        raise RuntimeError(
+                            f"Failed to encode audio chunk {i+1} to {output_format_str} "
+                            f"or generated invalid audio."
+                        )
+
+                    chunks_yielded += 1
+                    yield encoded_chunk
+                except Exception as e_chunk:
+                    logger.error(
+                        f"Error processing streaming audio chunk {i+1}: {e_chunk}",
+                        exc_info=True,
+                    )
+                    raise
+
+            if chunks_yielded == 0:
+                logger.error("Streaming audio generation yielded no chunks.")
+                raise RuntimeError("Audio generation resulted in no output.")
+
+            logger.info(
+                f"Successfully streamed {chunks_yielded} encoded audio chunks as {media_type}."
+            )
+            logger.debug(perf_monitor.report())
+
+        headers = {"X-TTS-Stream-Mode": "chunked-encoded-audio"}
+        if output_format_str == "wav":
+            headers["X-TTS-WAV-Streaming-Note"] = (
+                "Each chunk is a standalone WAV with its own header; clients requiring one WAV file may be incompatible."
+            )
+
+        return StreamingResponse(
+            stream_encoded_chunks(), media_type=media_type, headers=headers
+        )
+
+    all_audio_segments_np: List[np.ndarray] = []
+    engine_output_sample_rate: Optional[int] = None
 
     for i, chunk in enumerate(text_chunks):
         logger.info(f"Synthesizing chunk {i+1}/{len(text_chunks)}...")
@@ -641,10 +724,6 @@ async def custom_tts_endpoint(
         raise HTTPException(
             status_code=500, detail=f"Audio concatenation error: {e_concat}"
         )
-
-    output_format_str = (
-        request.output_format if request.output_format else get_audio_output_format()
-    )
 
     encoded_audio_bytes = utils.encode_audio(
         audio_array=final_audio_np,

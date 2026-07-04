@@ -2,6 +2,7 @@
 # Core TTS model loading and speech generation logic for KittenTTS ONNX.
 # Supports multiple KittenTTS model variants with hot-swappable model switching.
 
+import ctypes.util
 import gc
 import torch
 import os
@@ -340,15 +341,35 @@ def _init_espeak():
             logger.warning("eSpeak NG not found in common Windows locations.")
 
     elif os.name == "posix":  # Linux/macOS
-        logger.info("Checking for system-installed eSpeak NG on Linux...")
-        espeak_lib_path = "/usr/lib/x86_64-linux-gnu/libespeak-ng.so"
-        if Path(espeak_lib_path).exists():
+        logger.info("Checking for system-installed eSpeak NG on POSIX...")
+        candidate_paths = [
+            "/usr/lib/x86_64-linux-gnu/libespeak-ng.so.1",
+            "/usr/lib/x86_64-linux-gnu/libespeak-ng.so",
+            "/usr/lib/libespeak-ng.so.1",
+            "/usr/lib/libespeak-ng.so",
+        ]
+        espeak_lib_path = next(
+            (path for path in candidate_paths if Path(path).exists()),
+            None,
+        )
+
+        if espeak_lib_path is None:
+            espeak_lib_path = ctypes.util.find_library("espeak-ng")
+
+        if espeak_lib_path:
             os.environ["PHONEMIZER_ESPEAK_LIBRARY"] = espeak_lib_path
-            logger.info(f"Found and configured system eSpeak NG library: {espeak_lib_path}")
+            from phonemizer.backend.espeak.wrapper import (
+                EspeakWrapper as PhonemizeEspeakWrapper,
+            )
+
+            if hasattr(PhonemizeEspeakWrapper, "set_library"):
+                PhonemizeEspeakWrapper.set_library(espeak_lib_path)
+
+            logger.info(f"Found and configured eSpeak NG library: {espeak_lib_path}")
         else:
-            logger.warning(
-                f"Could not find system eSpeak NG library at {espeak_lib_path}. "
-                "Please ensure 'espeak-ng' is installed via your package manager."
+            raise RuntimeError(
+                "Could not find the eSpeak NG shared library. Please install both "
+                "'espeak-ng' and 'libespeak-ng1' using your package manager."
             )
 
     # Initialize phonemizer

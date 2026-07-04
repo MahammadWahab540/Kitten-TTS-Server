@@ -42,6 +42,7 @@ from config import (
     config_manager,
     get_host,
     get_port,
+    get_open_browser,
     get_log_file_path,
     get_output_path,
     get_ui_title,
@@ -160,13 +161,19 @@ async def lifespan(app: FastAPI):
             )
         else:
             logger.info("TTS Model loaded successfully via engine.")
-            host_address = get_host()
-            server_port = get_port()
-            browser_thread = threading.Thread(
-                target=lambda: _delayed_browser_open(host_address, server_port),
-                daemon=True,
-            )
-            browser_thread.start()
+            if get_open_browser():
+                host_address = get_host()
+                server_port = get_port()
+                browser_thread = threading.Thread(
+                    target=lambda: _delayed_browser_open(host_address, server_port),
+                    daemon=True,
+                )
+                browser_thread.start()
+            else:
+                logger.info(
+                    "Browser auto-open is disabled. Set server.open_browser=true "
+                    "or OPEN_BROWSER=true to enable it for local UI development."
+                )
 
         logger.info("Application startup sequence complete.")
         startup_complete_event.set()

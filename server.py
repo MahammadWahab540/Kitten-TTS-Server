@@ -146,6 +146,7 @@ async def lifespan(app: FastAPI):
             )
         else:
             logger.info("TTS Model loaded successfully via engine.")
+            engine.warmup(text="Hello")
             host_address = get_host()
             server_port = get_port()
             browser_thread = threading.Thread(
@@ -283,6 +284,17 @@ async def get_model_registry_endpoint():
 async def get_model_status_endpoint():
     """Returns the current download/loading progress for model switching."""
     return engine.get_download_status()
+
+
+@app.get("/health", tags=["Health"])
+async def health_endpoint():
+    """Returns service, model, and warmup health state."""
+    return {
+        "status": "ok" if engine.MODEL_LOADED else "degraded",
+        "model_loaded": engine.MODEL_LOADED,
+        "model": engine.get_model_info(),
+        "warmup": engine.get_warmup_info(),
+    }
 
 
 # --- API Endpoint for Initial UI Data ---

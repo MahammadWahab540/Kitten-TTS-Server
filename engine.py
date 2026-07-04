@@ -8,6 +8,7 @@ import os
 import json
 import logging
 import threading
+import time
 import numpy as np
 import onnxruntime as ort
 from typing import Optional, Tuple, List, Dict, Any
@@ -156,6 +157,9 @@ voices_data: Optional[dict] = None
 phonemizer_backend: Optional[phonemizer.backend.EspeakBackend] = None
 text_cleaner: Optional["TextCleaner"] = None
 MODEL_LOADED: bool = False
+WARMUP_COMPLETED: bool = False
+WARMUP_FAILED: bool = False
+WARMUP_DURATION_SECONDS: Optional[float] = None
 
 # Track which model is loaded
 loaded_model_selector: Optional[str] = None
@@ -258,6 +262,22 @@ def get_model_info() -> Dict[str, Any]:
         "size": None,
         "version": None,
         "device": loaded_model_device,
+    }
+
+
+def get_default_voice() -> str:
+    """Returns the production default voice for the currently loaded model."""
+    if loaded_model_selector and loaded_model_selector in MODEL_REGISTRY:
+        return MODEL_REGISTRY[loaded_model_selector]["default_voice"]
+    return "expr-voice-5-m"
+
+
+def get_warmup_info() -> Dict[str, Any]:
+    """Returns the current module-level warmup state."""
+    return {
+        "completed": WARMUP_COMPLETED,
+        "failed": WARMUP_FAILED,
+        "duration_seconds": WARMUP_DURATION_SECONDS,
     }
 
 
@@ -387,6 +407,7 @@ def load_model() -> bool:
         bool: True if the model was loaded successfully, False otherwise.
     """
     global onnx_session, voices_data, MODEL_LOADED
+    global WARMUP_COMPLETED, WARMUP_FAILED, WARMUP_DURATION_SECONDS
     global loaded_model_selector, loaded_model_repo_id, loaded_model_device
 
     if MODEL_LOADED:
@@ -528,6 +549,9 @@ def load_model() -> bool:
         loaded_model_selector = selector
         loaded_model_repo_id = model_repo_id
         MODEL_LOADED = True
+        WARMUP_COMPLETED = False
+        WARMUP_FAILED = False
+        WARMUP_DURATION_SECONDS = None
 
         _update_download_status("complete", f"{reg['display_name']} loaded successfully!", 100)
         logger.info(f"KittenTTS model loaded successfully: {reg['display_name']}")
@@ -575,6 +599,7 @@ def unload_model() -> bool:
         bool: True if the model was unloaded successfully.
     """
     global onnx_session, voices_data, MODEL_LOADED
+    global WARMUP_COMPLETED, WARMUP_FAILED, WARMUP_DURATION_SECONDS
     global loaded_model_selector, loaded_model_repo_id, loaded_model_device
     global _voice_aliases, _speed_priors
 
@@ -590,6 +615,9 @@ def unload_model() -> bool:
         voices_data = None
 
     MODEL_LOADED = False
+    WARMUP_COMPLETED = False
+    WARMUP_FAILED = False
+    WARMUP_DURATION_SECONDS = None
     loaded_model_selector = None
     loaded_model_repo_id = None
     loaded_model_device = None
@@ -806,6 +834,53 @@ def synthesize(
     except Exception as e:
         logger.error(f"Error during KittenTTS synthesis: {e}", exc_info=True)
         return None, None
+
+
+def warmup(text: str = "Hello", voice: Optional[str] = None) -> bool:
+    """
+    Warms up the loaded TTS model by synthesizing audio without saving it.
+
+    Args:
+        text: Text to synthesize for warmup.
+        voice: Voice identifier to use. Defaults to the loaded model's production
+            default voice.
+
+    Returns:
+        True if warmup synthesis completed successfully, False otherwise.
+    """
+    global WARMUP_COMPLETED, WARMUP_FAILED, WARMUP_DURATION_SECONDS
+
+    selected_voice = voice or get_default_voice()
+    logger.info("Starting KittenTTS warmup synthesis.")
+    logger.info(f"Warmup selected voice: {selected_voice}")
+
+    WARMUP_COMPLETED = False
+    WARMUP_FAILED = False
+    WARMUP_DURATION_SECONDS = None
+
+    start_time = time.perf_counter()
+    try:
+        audio, sample_rate = synthesize(text=text, voice=selected_voice)
+        WARMUP_DURATION_SECONDS = time.perf_counter() - start_time
+
+        if audio is None or sample_rate is None:
+            raise RuntimeError("Warmup synthesis returned no audio.")
+
+        WARMUP_COMPLETED = True
+        WARMUP_FAILED = False
+        logger.info(
+            f"KittenTTS warmup completed successfully in {WARMUP_DURATION_SECONDS:.3f}s."
+        )
+        return True
+    except Exception as e:
+        WARMUP_DURATION_SECONDS = time.perf_counter() - start_time
+        WARMUP_COMPLETED = False
+        WARMUP_FAILED = True
+        logger.error(
+            f"KittenTTS warmup failed after {WARMUP_DURATION_SECONDS:.3f}s: {e}",
+            exc_info=True,
+        )
+        return False
 
 
 # --- End File: engine.py ---

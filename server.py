@@ -18,6 +18,11 @@ from typing import Optional, List, Dict, Any, Literal, Iterator
 import webbrowser  # For automatic browser opening
 import threading  # For automatic browser opening
 
+
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import Depends
+import hmac
+
 from fastapi import (
     FastAPI,
     HTTPException,
@@ -192,6 +197,29 @@ async def lifespan(app: FastAPI):
         logger.info("TTS Server: Application shutdown complete.")
 
 
+
+security = HTTPBearer(auto_error=False)
+
+def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    api_key = os.environ.get("TTS_API_KEY")
+    if not api_key:
+        return None
+    if not credentials or not credentials.credentials:
+        raise HTTPException(status_code=401, detail="Missing API Key")
+    if not hmac.compare_digest(credentials.credentials, api_key):
+        raise HTTPException(status_code=403, detail="Invalid API Key")
+    return credentials.credentials
+
+def verify_management_access(api_key = Depends(verify_api_key)):
+    # Block if ENABLE_MANAGEMENT_ENDPOINTS is false
+    if os.environ.get("ENABLE_MANAGEMENT_ENDPOINTS", "true").lower() == "false":
+        raise HTTPException(status_code=403, detail="Management endpoints are disabled")
+    return api_key
+
+def verify_ui_access():
+    if os.environ.get("ENABLE_WEB_UI", "true").lower() == "false":
+        raise HTTPException(status_code=403, detail="Web UI is disabled")
+
 # --- FastAPI Application Instance ---
 app = FastAPI(
     title=get_ui_title(),
@@ -264,6 +292,7 @@ except RuntimeError as e_mount_outputs:
 
 
 @app.get("/health", tags=["Health"])
+@app.get("/api/tts/health", tags=["Health"])
 async def health_check():
     """Reports process, model, ONNX provider, and readiness health."""
     model_loaded = bool(engine.MODEL_LOADED)
@@ -315,7 +344,7 @@ async def health_check():
 
 # --- Main UI Route ---
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
-async def get_web_ui(request: Request):
+async def get_web_ui(request: Request, _: None = Depends(verify_ui_access)):
     """Serves the main web interface (index.html)."""
     logger.info("Request received for main UI page ('/').")
     try:
@@ -360,6 +389,7 @@ async def get_model_status_endpoint():
 
 
 @app.get("/health", tags=["Health"])
+@app.get("/api/tts/health", tags=["Health"])
 async def health_endpoint():
     """Returns service, model, and warmup health state."""
     return {
@@ -372,7 +402,7 @@ async def health_endpoint():
 
 # --- API Endpoint for Initial UI Data ---
 @app.get("/api/ui/initial-data", tags=["UI Helpers"])
-async def get_ui_initial_data():
+async def get_ui_initial_data(_: None = Depends(verify_management_access)):
     """
     Provides all necessary initial data for the UI to render,
     including configuration, file lists, presets, and model information.
@@ -425,7 +455,7 @@ async def get_ui_initial_data():
 
 # --- Configuration Management API Endpoints ---
 @app.post("/save_settings", response_model=UpdateStatusResponse, tags=["Configuration"])
-async def save_settings_endpoint(request: Request):
+async def save_settings_endpoint(request: Request, _: None = Depends(verify_management_access)):
     """
     Saves partial configuration updates to the config.yaml file.
     Merges the update with the current configuration.
@@ -468,7 +498,7 @@ async def save_settings_endpoint(request: Request):
 @app.post(
     "/reset_settings", response_model=UpdateStatusResponse, tags=["Configuration"]
 )
-async def reset_settings_endpoint():
+async def reset_settings_endpoint(_: None = Depends(verify_management_access)):
     """Resets the configuration in config.yaml back to hardcoded defaults."""
     logger.warning("Request received to reset all configurations to default values.")
     try:
@@ -494,7 +524,7 @@ async def reset_settings_endpoint():
 @app.post(
     "/restart_server", response_model=UpdateStatusResponse, tags=["Configuration"]
 )
-async def restart_server_endpoint():
+async def restart_server_endpoint(_: None = Depends(verify_management_access)):
     """
     Triggers an async hot-swap of the TTS model engine.
     Returns immediately while the model downloads and loads in the background.
@@ -517,7 +547,7 @@ async def restart_server_endpoint():
 
 
 @app.post("/api/cancel-loading", tags=["Configuration"])
-async def cancel_loading_endpoint():
+async def cancel_loading_endpoint(_: None = Depends(verify_management_access)):
     """Cancels any in-progress model loading."""
     logger.info("Request received for /api/cancel-loading.")
     cancelled = engine.cancel_loading()
@@ -527,7 +557,7 @@ async def cancel_loading_endpoint():
 
 
 @app.post("/api/unload", tags=["Configuration"])
-async def unload_model_endpoint():
+async def unload_model_endpoint(_: None = Depends(verify_management_access)):
     """
     Unloads the TTS model and releases all resources.
     The model will need to be reloaded (via /restart_server) before TTS requests can be processed.
@@ -547,6 +577,7 @@ async def unload_model_endpoint():
 # --- TTS Generation Endpoint ---
 
 
+@app.post("/api/tts/speak", tags=["TTS Generation"])
 @app.post(
     "/tts",
     tags=["TTS Generation"],
@@ -571,7 +602,7 @@ async def unload_model_endpoint():
     },
 )
 async def custom_tts_endpoint(
-    request: CustomTTSRequest, background_tasks: BackgroundTasks
+    request: CustomTTSRequest, background_tasks: BackgroundTasks, _: None = Depends(verify_api_key)
 ):
     """
     Generates speech audio from text using specified parameters.
@@ -581,6 +612,13 @@ async def custom_tts_endpoint(
         enabled=config_manager.get_bool("server.enable_performance_monitor", False)
     )
     perf_monitor.record("TTS request received")
+
+    output_format_str = (
+        request.output_format if request.output_format else get_audio_output_format()
+    )
+    if output_format_str not in ["wav", "opus"]:
+        raise HTTPException(status_code=400, detail=f"Invalid format: {output_format_str}. Only 'wav' or 'opus' are supported.")
+
 
     if not engine.MODEL_LOADED:
         logger.error("TTS request failed: Model not loaded.")
@@ -600,9 +638,11 @@ async def custom_tts_endpoint(
     perf_monitor.record("Parameters resolved")
 
     final_output_sample_rate = get_audio_sample_rate()
+
     output_format_str = (
         request.output_format if request.output_format else get_audio_output_format()
     )
+
 
     if request.split_text and len(request.text) > (
         request.chunk_size * 1.5 if request.chunk_size else 120 * 1.5
@@ -675,6 +715,8 @@ async def custom_tts_endpoint(
                             f"or generated invalid audio."
                         )
 
+                    if output_format_str == "wav" and chunks_yielded > 0:
+                        encoded_chunk = encoded_chunk[44:]
                     chunks_yielded += 1
                     yield encoded_chunk
                 except Exception as e_chunk:
@@ -848,7 +890,7 @@ async def custom_tts_endpoint(
 
 
 @app.post("/v1/audio/speech", tags=["OpenAI Compatible"])
-async def openai_speech_endpoint(request: OpenAISpeechRequest):
+async def openai_speech_endpoint(request: OpenAISpeechRequest, _: None = Depends(verify_api_key)):
     # Check if the TTS model is loaded
     if not engine.MODEL_LOADED:
         raise HTTPException(
@@ -948,6 +990,8 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
                     if not first_yield_logged:
                         log_timing("first chunk yielded")
                         first_yield_logged = True
+                    if request.response_format == "wav" and chunk_index > 0:
+                        encoded_audio = encoded_audio[44:]
                     yield encoded_audio
 
                 log_timing("streaming response completed")

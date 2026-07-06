@@ -36,8 +36,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "port": 8005,  # Port number for the server.
         "use_ngrok": False,  # Placeholder for ngrok integration (if used).
         "use_auth": False,  # Placeholder for basic authentication (if used).
-        "auth_username": "user",  # Default username if authentication is enabled.
-        "auth_password": "password",  # Default password if authentication is enabled.
         "log_file_path": str(
             DEFAULT_LOGS_PATH / "tts_server.log"
         ),  # Path to the server log file.

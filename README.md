@@ -533,3 +533,12 @@ This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) f
 ## 🤝 Contributing
 
 Contributions, issues, and feature requests are welcome! Please feel free to open an issue or submit a pull request.
+
+### API Authentication
+The `/tts` and `/api/tts/speak` endpoints, as well as the OpenAI compatible endpoint `/v1/audio/speech`, now require authentication via an API Key when `TTS_API_KEY` environment variable is set.
+Provide the key in the `Authorization` header:
+`Authorization: Bearer <your_api_key>`
+
+### Dependency Footprint Note (PR #16)
+The CPU image size is significantly large (~2.5GB+) because `misaki[en]>=0.9.4` automatically pulls `spacy-curated-transformers` and `torch`. This violates the lightweight footprint requirement for small Railway instances.
+*Recommendation for future:* Suggest moving to a lighter G2P/phonemizer pipeline, such as `gruut` or `phonemizer` with standard `espeak-ng` directly without transformer models to keep the image size small.

@@ -415,21 +415,6 @@ docker compose exec kitten-tts-server python -c "import torch; print(f'CUDA avai
 ```
 If `CUDA available:` prints `True`, your GPU setup is working correctly
 
-## 🚂 Deploying on Railway
-
-The repository includes `railway.json`, which builds the CPU image using `Dockerfile.cpu`.
-
-1.  **Import the repo** into Railway (GitHub integration) — it auto-detects `railway.json`.
-2.  **Set environment variables** in the Railway service settings:
-    *   `TTS_API_KEY` — a strong random key (required for any TTS/management/UI access).
-    *   `ENABLE_WEB_UI=false` and `ENABLE_MANAGEMENT_ENDPOINTS=false` (defaults are already safe).
-    *   `ALLOWED_ORIGINS` — your frontend origins, comma-separated.
-    *   `KITTEN_TTS_DISABLE_HF_FALLBACK=1` — stops silent Hugging Face downloads at runtime.
-    *   `PORT` is provided by Railway; the server binds to `0.0.0.0:$PORT`.
-3.  **Healthcheck:** use `GET /health` (returns `200` once the model is loaded; `503` while loading). Railway can poll `/health`.
-4.  **Baked model behavior:** the CPU image expects the model to load from the baked/cached path. If the baked model is missing and `KITTEN_TTS_DISABLE_HF_FALLBACK=1`, the server stays up (health reports `model_load_failed`) but will **not** silently pull from Hugging Face. Set the variable to allow a one-time download instead.
-5.  **CPU image size risk:** the image installs `misaki[en]`, `librosa`, `pydub`, and related deps, which make the CPU image larger than a minimal TTS runtime. Budget disk/transfer accordingly.
-
 ## 💡 Usage Guide
 
 ### Generate Your First Audio
@@ -473,14 +458,12 @@ This endpoint offers the most control.
       "text": "Hello from the KittenTTS API!",
       "voice": "Reed",
       "speed": 1.0,
-      "output_format": "wav",
+      "output_format": "mp3",
       "split_text": true,
       "chunk_size": 300
     }
     ```
-*   **Response:** Streaming audio file (`audio/wav` or `audio/opus`).
-*   **Supported formats:** Only `wav` and `opus` are supported in this CPU deployment. **MP3 is intentionally not supported** (it would require `ffmpeg`/`pydub` and adds heavy dependencies / Railway risk). Requests with `output_format: "mp3"` return a clear `400` error: `MP3 output is not supported in this deployment. Use wav.`
-*   **Authentication:** Requires an API key (see [Security](#-security--production-hardening)). `wav` streaming keeps the RIFF header on the first chunk, so the stream is a valid, decodeable WAV file.
+*   **Response:** Streaming audio file (`audio/wav`, `audio/mp3`, etc.).
 
 ### OpenAI-Compatible Endpoint: `/v1/audio/speech`
 
@@ -497,49 +480,18 @@ Use this for drop-in compatibility with scripts expecting OpenAI's TTS API struc
       "speed": 0.9
     }
     ```
-*   **Latency check:** WAV responses for medium/long text stream sentence chunks as they are generated. The first chunk keeps the WAV/RIFF header so the stream is a single, valid WAV file. `response_format` accepts `wav` or `opus` only (`mp3` is not supported and returns a `400`).
+*   **Latency check:** WAV responses for medium/long text stream sentence chunks as they are generated. MP3 and Opus may still use a buffered compatibility path.
     ```bash
     curl -s -o /tmp/out.wav -w "TTFB=%{time_starttransfer}s TOTAL=%{time_total}s STATUS=%{http_code}\n" -X POST "$BASE_URL/v1/audio/speech" -H "Content-Type: application/json" -d '{"model":"kitten-tts-nano-0.1","input":"Welcome to Pathwisse","voice":"expr-voice-2-f","response_format":"wav"}'
     ```
 
 ### Model Management Endpoints
 
-> ⚠️ Management endpoints (`/restart_server`, `/api/cancel-loading`, `/api/unload`, `/save_settings`, `/reset_settings`) are **disabled by default**. They only work when `ENABLE_MANAGEMENT_ENDPOINTS=true` **and** a valid API key is provided.
-
 *   `GET /api/model-info` — Returns details about the currently loaded model.
 *   `GET /api/model-registry` — Returns all available models for the UI dropdown.
 *   `GET /api/model-status` — Returns download/loading progress during model switching.
-*   `POST /restart_server` — Triggers an async model hot-swap based on current config. *(management + auth required)*
-*   `POST /api/cancel-loading` — Cancels an in-progress model download/load. *(management + auth required)*
-
-### 🔒 Security & Production Hardening
-
-The server is **safe-by-default**: it never exposes protected or management functionality without configuration.
-
-**Required production environment variables:**
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `TTS_API_KEY` | *(unset)* | **Required.** API key for all TTS, management, and UI endpoints. If unset, protected endpoints return `503` (fail-closed) instead of becoming public. |
-| `ALLOWED_ORIGINS` | `http://localhost:3000,http://localhost:5173,http://localhost:8000` | Comma-separated CORS allow-list. No wildcard, no credentials. |
-| `ENABLE_MANAGEMENT_ENDPOINTS` | `false` | Enables dangerous management endpoints only when `true` **and** a valid key is supplied. |
-| `ENABLE_WEB_UI` | `false` | Serves the Web UI and `/api/ui/initial-data` only when `true` **and** a valid key is supplied. Sensitive config is sanitized even then. |
-| `KITTEN_TTS_DISABLE_HF_FALLBACK` | *(unset)* | Set to `1` to prevent silent Hugging Face downloads when a baked model is expected. |
-
-**Authentication** — all TTS endpoints (`/tts`, `/api/tts/speak`, `/v1/audio/speech`) require a key via either header:
-
-```bash
-curl -X POST "$BASE_URL/v1/audio/speech" \
-  -H "Authorization: Bearer $TTS_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"kitten-tts","input":"Hello","voice":"default","response_format":"wav"}'
-# or
-curl -X POST "$BASE_URL/v1/audio/speech" -H "X-API-Key: $TTS_API_KEY" ...
-```
-
-Key comparison uses `hmac.compare_digest` (constant-time). Public endpoints: `/health` and `/api/tts/health` only.
-
-**Do not expose this service publicly without `TTS_API_KEY` set.** Management endpoints and the Web UI are off by default; never enable them on an untrusted network.
+*   `POST /restart_server` — Triggers an async model hot-swap based on current config.
+*   `POST /api/cancel-loading` — Cancels an in-progress model download/load.
 
 ## ⚙️ Configuration
 
@@ -550,7 +502,7 @@ All server settings are managed in the `config.yaml` file. It's created automati
 *   `model.repo_id`: The active model selector (e.g., `kitten-nano-0.8-int8` or a HuggingFace repo ID).
 *   `tts_engine.device`: Set to `auto`, `cuda`, or `cpu`. The server will use your GPU if set to `auto` or `cuda` and a compatible environment is found.
 *   `generation_defaults.speed`: Default speech speed (1.0 is normal).
-*   `audio_output.format`: Default audio format (`wav` or `opus`; `mp3` is not supported in this deployment).
+*   `audio_output.format`: Default audio format (`wav`, `mp3`, `opus`).
 
 ## 🛠️ Troubleshooting
 
@@ -582,7 +534,22 @@ This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) f
 
 Contributions, issues, and feature requests are welcome! Please feel free to open an issue or submit a pull request.
 
-### API Authentication
+
+### API Authentication and Security Defaults
+For safe deployment, the following security defaults are enabled:
+- `ENABLE_WEB_UI` is `false` by default.
+- `ENABLE_MANAGEMENT_ENDPOINTS` is `false` by default.
+- API endpoints (`/tts`, `/api/tts/speak`, `/v1/audio/speech`, `/api/unload`, etc) require a configured `TTS_API_KEY`. If it is unset, these endpoints fail securely.
+
+Provide your configured key via `Authorization: Bearer <your_api_key>` or `X-API-Key: <your_api_key>`.
+Only `/health` and `/api/tts/health` are public without auth.
+
+### CORS Configuration
+CORS origins should be specified via the `ALLOWED_ORIGINS` environment variable (comma-separated, e.g. `http://localhost:3000,http://localhost:5173`). Wildcard `*` origins are no longer permitted with credentials in production.
+
+### MP3 Support
+To ensure compatibility in lightweight server environments (like Railway), MP3 generation is **intentionally unsupported** in this deployment. Please request `wav` (default) or `opus`.
+
 The `/tts` and `/api/tts/speak` endpoints, as well as the OpenAI compatible endpoint `/v1/audio/speech`, now require authentication via an API Key when `TTS_API_KEY` environment variable is set.
 Provide the key in the `Authorization` header:
 `Authorization: Bearer <your_api_key>`

@@ -1,6 +1,8 @@
 server:
   host: 0.0.0.0
   port: 8005
+  use_ngrok: false
+  use_auth: false
   log_file_path: logs/tts_server.log
   log_file_max_size_mb: 10
   log_file_backup_count: 5

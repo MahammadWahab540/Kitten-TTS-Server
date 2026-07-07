@@ -31,7 +31,7 @@ class CustomTTSRequest(BaseModel):
     )
 
     output_format: Optional[Literal["wav", "opus", "mp3"]] = Field(
-        "wav", description="Desired audio output format. Note: 'mp3' is accepted by the schema but rejected with HTTP 400 (MP3 is not supported in this CPU deployment)."
+        "wav", description="Desired audio output format."
     )
 
     split_text: Optional[bool] = Field(

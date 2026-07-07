@@ -15,8 +15,6 @@ from pydub import AudioSegment
 
 import numpy as np
 import soundfile as sf
-import torchaudio  # For saving PyTorch tensors and potentially speed adjustment.
-import torch
 
 # Configuration manager to get paths dynamically.
 # Assumes config.py and its config_manager are in the same directory or accessible via PYTHONPATH.
@@ -427,12 +425,21 @@ def save_audio_to_file(
         return False
 
 
+    import torchaudio
+    import torch
 def save_audio_tensor_to_file(
-    audio_tensor: torch.Tensor,
+    audio_tensor: 'torch.Tensor',
     sample_rate: int,
     file_path_str: str,
     output_format: str = "wav",
 ) -> bool:
+    try:
+        import torch
+        import torchaudio
+    except ImportError as e:
+        logger.error(f"Failed to import torch/torchaudio: {e}")
+        return False
+
     """
     Saves a PyTorch audio tensor to a file using torchaudio.
 
@@ -473,9 +480,18 @@ def save_audio_tensor_to_file(
 
 
 # --- Audio Manipulation Utilities ---
+    import torchaudio
+    import torch
 def apply_speed_factor(
-    audio_tensor: torch.Tensor, sample_rate: int, speed_factor: float
-) -> Tuple[torch.Tensor, int]:
+    audio_tensor: 'torch.Tensor', sample_rate: int, speed_factor: float
+) -> Tuple['torch.Tensor', int]:
+    try:
+        import torch
+        import torchaudio
+    except ImportError as e:
+        logger.error(f"Failed to import torch/torchaudio: {e}")
+        return audio_tensor, sample_rate
+
     """
     Applies a speed factor to an audio tensor.
     Uses librosa.effects.time_stretch if available for pitch preservation.

@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 venv/
+.venv/
 model_cache/
 outputs/
 logs/

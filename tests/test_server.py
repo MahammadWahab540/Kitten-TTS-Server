@@ -214,22 +214,51 @@ def test_mp3_rejected_on_openai(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# /v1/audio/speech streaming: first WAV chunk keeps its header (exactly one RIFF)
+# /v1/audio/speech streaming: must be a single valid WAV describing the FULL
+# concatenated audio (correct RIFF/data sizes, no truncation).
 # ---------------------------------------------------------------------------
-def test_openai_stream_wav_single_riff(monkeypatch):
+SR = 24000
+CHUNK_FRAMES = SR // 4  # 0.25s per chunk
+
+
+def _fake_synthesize_factory(monkeypatch, n_chunks_seen):
     import numpy as np
     import engine
 
-    sr = 24000
-    silence = np.zeros(sr // 4, dtype=np.float32)  # ~0.25s of silence
+    silence = np.zeros(CHUNK_FRAMES, dtype=np.float32)
 
     def fake_synthesize(text, voice, speed=None):
-        return silence.copy(), sr
+        n_chunks_seen[0] += 1
+        return silence.copy(), SR
 
     monkeypatch.setattr(engine, "MODEL_LOADED", True)
     monkeypatch.setattr("engine.synthesize", fake_synthesize)
 
-    long_text = ("Hello there. " * 60)  # > 300 chars -> triggers streaming path
+
+def _assert_full_wav(data, expected_chunks):
+    import io
+    import wave
+
+    assert data[:4] == b"RIFF", "WAV must start with a RIFF header"
+    assert data.count(b"RIFF") == 1, "WAV must contain exactly one RIFF header"
+    with wave.open(io.BytesIO(data), "rb") as wf:
+        assert wf.getnchannels() == 1, "expected mono"
+        assert wf.getframerate() == SR
+        total_frames = wf.getnframes()
+        expected_frames = expected_chunks * CHUNK_FRAMES
+        assert total_frames == expected_frames, (
+            f"frame count {total_frames} should equal sum of chunks "
+            f"({expected_frames}), not just the first chunk"
+        )
+        pcm = wf.readframes(total_frames)
+        assert len(pcm) == total_frames * 2, "PCM bytes must match full frame count (16-bit)"
+        assert len(pcm) > CHUNK_FRAMES * 2, "audio must be longer than a single chunk"
+
+
+def test_openai_stream_wav_full_audio(monkeypatch):
+    seen = [0]
+    _fake_synthesize_factory(monkeypatch, seen)
+    long_text = "Hello there. " * 60  # > 300 chars -> multi-chunk path
     response = client.post(
         "/v1/audio/speech",
         headers={"Authorization": "Bearer test-key"},
@@ -241,27 +270,14 @@ def test_openai_stream_wav_single_riff(monkeypatch):
         },
     )
     assert response.status_code == 200, response.text
-    data = response.content
-    assert data[:4] == b"RIFF", "Streamed WAV must start with a RIFF header"
-    assert data.count(b"RIFF") == 1, "Streamed WAV must contain exactly one RIFF header"
+    assert seen[0] > 1, "expected multiple synthesized chunks"
+    _assert_full_wav(response.content, seen[0])
 
 
-def test_openai_stream_wav_decodable(monkeypatch):
-    import io
-    import wave
-    import numpy as np
-    import engine
-
-    sr = 24000
-    silence = np.zeros(sr // 4, dtype=np.float32)
-
-    def fake_synthesize(text, voice, speed=None):
-        return silence.copy(), sr
-
-    monkeypatch.setattr(engine, "MODEL_LOADED", True)
-    monkeypatch.setattr("engine.synthesize", fake_synthesize)
-
-    long_text = ("Decodable audio test. " * 60)
+def test_openai_stream_wav_latency_headers(monkeypatch):
+    seen = [0]
+    _fake_synthesize_factory(monkeypatch, seen)
+    long_text = "Hello there. " * 60
     response = client.post(
         "/v1/audio/speech",
         headers={"Authorization": "Bearer test-key"},
@@ -273,9 +289,29 @@ def test_openai_stream_wav_decodable(monkeypatch):
         },
     )
     assert response.status_code == 200
-    with wave.open(io.BytesIO(response.content), "rb") as wf:
-        assert wf.getnchannels() >= 1
-        assert wf.getframerate() == sr
+    for h in ("X-TTS-Total-Time-Ms", "X-TTS-Inference-Time-Ms", "X-TTS-Model", "X-TTS-Voice"):
+        assert h in response.headers, f"missing latency header {h}"
+
+
+def test_tts_stream_wav_full_audio(monkeypatch):
+    seen = [0]
+    _fake_synthesize_factory(monkeypatch, seen)
+    long_text = "Hello there. " * 60  # triggers split > 1 chunk
+    response = client.post(
+        "/api/tts/speak",
+        headers={"Authorization": "Bearer test-key"},
+        json={
+            "text": long_text,
+            "voice": "default",
+            "format": "wav",
+            "stream": True,
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert seen[0] > 1, "expected multiple synthesized chunks"
+    _assert_full_wav(response.content, seen[0])
+    for h in ("X-TTS-Total-Time-Ms", "X-TTS-Inference-Time-Ms", "X-TTS-Model", "X-TTS-Voice"):
+        assert h in response.headers, f"missing latency header {h}"
 
 
 # ---------------------------------------------------------------------------

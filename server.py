@@ -400,8 +400,14 @@ async def health_check():
 
 # --- Main UI Route ---
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
-async def get_web_ui(request: Request, _: None = Depends(verify_ui_access)):
-    """Serves the main web interface (index.html)."""
+async def get_web_ui(request: Request):
+    """Serves the main web interface (index.html).
+
+    The page itself is viewable without an API key; actual TTS generation
+    through the API endpoints remains protected by verify_api_key.
+    """
+    # NOTE: intentionally does NOT depend on verify_ui_access so the UI can be
+    # viewed without an API key. Generation endpoints stay auth-gated.
     logger.info("Request received for main UI page ('/').")
     try:
         index_path = ui_static_path / "index.html"

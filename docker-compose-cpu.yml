@@ -16,13 +16,23 @@ services:
       # Mount local directories for persistent app data
       - ./outputs:/app/outputs
       - ./logs:/app/logs
-      # Named volume for Hugging Face model cache to persist across container rebuilds
+      # Named volume for the Hugging Face model cache to persist across container rebuilds
       - hf_cache:/app/hf_cache
 
     restart: unless-stopped
     environment:
       # Enable faster Hugging Face downloads inside the container
       - HF_HUB_ENABLE_HF_TRANSFER=1
+      # --- Safe-by-default production configuration ---
+      # REQUIRED: set a strong key. Until set, protected endpoints return 503.
+      - TTS_API_KEY=${TTS_API_KEY:-}
+      # Management endpoints and Web UI are OFF by default.
+      - ENABLE_MANAGEMENT_ENDPOINTS=${ENABLE_MANAGEMENT_ENDPOINTS:-false}
+      - ENABLE_WEB_UI=${ENABLE_WEB_UI:-false}
+      # Comma-separated list of allowed CORS origins (no wildcard).
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:3000,http://localhost:5173,http://localhost:8000}
+      # Prevent silent Hugging Face downloads when a baked model is expected.
+      - KITTEN_TTS_DISABLE_HF_FALLBACK=${KITTEN_TTS_DISABLE_HF_FALLBACK:-1}
 
 # Define the named volume for the Hugging Face cache
 volumes:

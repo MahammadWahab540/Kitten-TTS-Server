@@ -73,7 +73,7 @@ class OpenAISpeechRequest(BaseModel):
     model: str
     input_: str = Field(..., alias="input", min_length=1)
     voice: str
-    response_format: Literal["wav", "opus", "mp3"] = "wav"  # Add "mp3"
+    response_format: Literal["wav", "opus", "mp3"] = "wav"  # 'mp3' is rejected with HTTP 400 (not supported in this CPU deployment)
     speed: float = 1.0
     seed: Optional[int] = None
 
@@ -200,25 +200,67 @@ async def lifespan(app: FastAPI):
 
 security = HTTPBearer(auto_error=False)
 
-def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
+# Keys/values that must never be leaked through UI config responses.
+_SENSITIVE_CONFIG_KEYS = (
+    "tts_api_key",
+    "api_key",
+    "auth_username",
+    "auth_password",
+    "use_auth",
+)
+
+
+def _resolve_api_key_from_request(request: Request) -> str:
+    """Extract the API key from either the Authorization: Bearer header
+    or the X-API-Key header."""
+    auth_header = request.headers.get("Authorization")
+    if auth_header and auth_header.lower().startswith("bearer "):
+        return auth_header.split(" ", 1)[1].strip()
+    x_key = request.headers.get("X-API-Key")
+    if x_key:
+        return x_key.strip()
+    return ""
+
+
+def verify_api_key(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    """Fail-closed API key verification.
+
+    When TTS_API_KEY is not configured, protected endpoints are NOT made
+    public. They return a 503 configuration error instead so the service
+    never silently runs unauthenticated in production.
+    """
     api_key = os.environ.get("TTS_API_KEY")
     if not api_key:
-        return None
-    if not credentials or not credentials.credentials:
-        raise HTTPException(status_code=401, detail="Missing API Key")
-    if not hmac.compare_digest(credentials.credentials, api_key):
-        raise HTTPException(status_code=403, detail="Invalid API Key")
-    return credentials.credentials
+        raise HTTPException(
+            status_code=503,
+            detail="Server is not configured for access: TTS_API_KEY is not set.",
+        )
 
-def verify_management_access(api_key = Depends(verify_api_key)):
-    # Block if ENABLE_MANAGEMENT_ENDPOINTS is false
-    if os.environ.get("ENABLE_MANAGEMENT_ENDPOINTS", "true").lower() == "false":
+    provided = _resolve_api_key_from_request(request)
+    if not provided and credentials is not None and credentials.credentials:
+        provided = credentials.credentials
+
+    if not provided:
+        raise HTTPException(status_code=401, detail="Missing API Key")
+    if not hmac.compare_digest(provided, api_key):
+        raise HTTPException(status_code=403, detail="Invalid API Key")
+    return provided
+
+
+def verify_management_access(api_key: str = Depends(verify_api_key)):
+    # Management endpoints are OFF by default (safe).
+    if os.environ.get("ENABLE_MANAGEMENT_ENDPOINTS", "false").lower() != "true":
         raise HTTPException(status_code=403, detail="Management endpoints are disabled")
     return api_key
 
-def verify_ui_access():
-    if os.environ.get("ENABLE_WEB_UI", "true").lower() == "false":
+
+def verify_ui_access(api_key: str = Depends(verify_api_key)):
+    if os.environ.get("ENABLE_WEB_UI", "false").lower() != "true":
         raise HTTPException(status_code=403, detail="Web UI is disabled")
+    return api_key
 
 # --- FastAPI Application Instance ---
 app = FastAPI(
@@ -229,10 +271,24 @@ app = FastAPI(
 )
 
 # --- CORS Middleware ---
+# Safe-by-default CORS: only explicitly allowed origins are accepted.
+# Wildcard origins are never combined with credentials.
+def _parse_allowed_origins() -> list:
+    raw = os.getenv("ALLOWED_ORIGINS")
+    if raw:
+        return [o.strip() for o in raw.split(",") if o.strip()]
+    # Safe localhost development defaults (no wildcard, no "null").
+    return [
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://localhost:8000",
+    ]
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*", "null"],
-    allow_credentials=True,
+    allow_origins=_parse_allowed_origins(),
+    allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
@@ -402,14 +458,17 @@ async def health_endpoint():
 
 # --- API Endpoint for Initial UI Data ---
 @app.get("/api/ui/initial-data", tags=["UI Helpers"])
-async def get_ui_initial_data(_: None = Depends(verify_management_access)):
+async def get_ui_initial_data(_: str = Depends(verify_ui_access)):
     """
-    Provides all necessary initial data for the UI to render,
-    including configuration, file lists, presets, and model information.
+    Provides sanitized initial data for the UI to render.
+    Requires a valid API key and ENABLE_WEB_UI=true. Sensitive values
+    (API keys, auth config, internal file paths, full environment) are
+    never included in the response.
     """
     logger.info("Request received for /api/ui/initial-data.")
     try:
         full_config = get_full_config_for_template()
+        safe_config = _sanitize_config_for_ui(full_config)
 
         # Get model information for UI
         model_info = engine.get_model_info()
@@ -439,7 +498,7 @@ async def get_ui_initial_data(_: None = Depends(verify_management_access)):
         }
 
         return {
-            "config": full_config,
+            "config": safe_config,
             "presets": loaded_presets,
             "initial_gen_result": initial_gen_result_placeholder,
             "model_info": model_info,
@@ -451,6 +510,19 @@ async def get_ui_initial_data(_: None = Depends(verify_management_access)):
         raise HTTPException(
             status_code=500, detail="Failed to load initial data for UI."
         )
+
+
+def _sanitize_config_for_ui(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy of the config with sensitive keys removed recursively."""
+    if isinstance(config, dict):
+        return {
+            k: _sanitize_config_for_ui(v)
+            for k, v in config.items()
+            if str(k).lower() not in _SENSITIVE_CONFIG_KEYS
+        }
+    if isinstance(config, list):
+        return [_sanitize_config_for_ui(item) for item in config]
+    return config
 
 
 # --- Configuration Management API Endpoints ---
@@ -617,6 +689,11 @@ async def custom_tts_endpoint(
         request.output_format if request.output_format else get_audio_output_format()
     )
     if output_format_str not in ["wav", "opus"]:
+        if output_format_str == "mp3":
+            raise HTTPException(
+                status_code=400,
+                detail="MP3 output is not supported in this deployment. Use wav.",
+            )
         raise HTTPException(status_code=400, detail=f"Invalid format: {output_format_str}. Only 'wav' or 'opus' are supported.")
 
 
@@ -891,6 +968,14 @@ async def custom_tts_endpoint(
 
 @app.post("/v1/audio/speech", tags=["OpenAI Compatible"])
 async def openai_speech_endpoint(request: OpenAISpeechRequest, _: None = Depends(verify_api_key)):
+    # MP3 is intentionally unsupported in this CPU deployment.
+    # Validate the requested format before any model/availability checks.
+    if request.response_format == "mp3":
+        raise HTTPException(
+            status_code=400,
+            detail="MP3 output is not supported in this deployment. Use wav.",
+        )
+
     # Check if the TTS model is loaded
     if not engine.MODEL_LOADED:
         raise HTTPException(
@@ -990,7 +1075,7 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest, _: None = Depends
                     if not first_yield_logged:
                         log_timing("first chunk yielded")
                         first_yield_logged = True
-                    if request.response_format == "wav" and chunk_index > 0:
+                    if request.response_format == "wav" and chunk_index > 1:
                         encoded_audio = encoded_audio[44:]
                     yield encoded_audio
 
